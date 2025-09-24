@@ -1,0 +1,15 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Notebooks & OS
+.ipynb_checkpoints/
+.DS_Store
+
+# Outputs (generated)
+out/
+models/
+report/figures/
