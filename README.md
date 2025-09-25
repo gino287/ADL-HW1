@@ -1,86 +1,90 @@
-﻿ADL HW1 — Chinese Extractive QA
-專案簡介
+﻿# ADL HW1 — Chinese Extractive QA
 
-這個專案是 ADL HW1 的骨架專案，主題為 Chinese Extractive QA。
-整個流程分兩階段：
+## Project Overview
+This project is the framework for **ADL HW1**, focusing on **Chinese Extractive Question Answering**. The process consists of two main stages:
 
-Paragraph Selection (psel)：從 context.json 中挑出最相關的段落
+1. **Paragraph Selection (psel)**: Select the most relevant paragraphs from `context.json`
+2. **Span Selection (span)**: Extract the final answer from the selected paragraphs
 
-Span Selection (span)：在挑出的段落中抽取答案
+The final output is a `submission.csv` file in the following format:
+```
+id,answer
+5e7a923dd6e4ccb8730eb95230e0c908,1996年
+...
+```
 
-最終輸出一個 submission.csv，格式：
-
-id,prediction_text
-
-
-檔案架構
+## Directory Structure
+```
 adl-hw1/
-  scripts/
-    download.sh        # 線上階段（下載模型）
-    run.sh             # 離線階段（整個 pipeline）
-  src/
-    dataio/load_adl.py # Day2 新增，資料轉換成多選題格式
-    psel/train.py      # 段落選擇訓練程式 (BERT 多選題)
-    psel/infer.py      # 段落選擇推論程式
-    span/infer.py      # 片段抽取 (目前還是 dummy)
-    utils/format_kaggle.py # 轉成 submission.csv
-  models/
-    psel-best/         # 訓練好的段落選擇模型 (Day2 存這裡)
-  data/
-    context.json  
-    train.json
-    valid.json
-    test.json     
-  out/
-    selected.json      # psel 輸出 (段落選擇結果)
-    predictions.json   # span 輸出 (答案抽取結果)
-    submission.csv     # Kaggle 最終上傳檔
-  report/figures/
-  README.md
-  requirements.txt
+├── scripts/
+│   ├── download.sh     # Online stage (model download)
+│   └── run.sh          # Offline stage (complete pipeline)
+├── src/
+│   ├── dataio/
+│   │   └── load_adl.py # Data conversion to multiple-choice format
+│   ├── psel/
+│   │   ├── train.py    # Paragraph selection training (BERT multiple-choice)
+│   │   └── infer.py    # Paragraph selection inference
+│   ├── span/
+│   │   ├── train.py    # Span extraction training (BERT QA)
+│   │   └── infer.py    # Span extraction inference
+│   └── utils/
+│       └── format_kaggle.py # Conversion to submission.csv
+├── models/
+│   ├── psel-best/      # Trained paragraph selection model
+│   └── span-best/      # Trained span extraction model
+├── data/
+│   ├── context.json
+│   ├── train.json
+│   ├── valid.json
+│   └── test.json
+├── out/
+│   ├── selected.json   # psel output (paragraph selection results)
+│   ├── predictions.json # span output (answer extraction results)
+│   └── submission.csv  # Final Kaggle submission file
+├── report/figures/
+├── README.md
+└── requirements.txt
+```
 
+## Usage Instructions
 
-  使用方式
-線上階段 (下載模型)
+### Online Stage (Download Models)
+```bash
 bash scripts/download.sh
+# Validation
 test -f models/psel-best/config.json && test -f models/span-best/meta.json && echo "[ok] download stage passed"
+```
 
-離線階段 (完整 pipeline)
-bash scripts/run.sh data/context.json data/test.json out/submission.csv
+### Offline Stage (Complete Pipeline)
+```bash
+bash scripts/run.sh
+```
 
+The process will sequentially:
+1. **Paragraph Selection (psel)**: Read `context.json` and `test.json`, select relevant paragraphs → `out/selected.json`
+2. **Span Extraction (span)**: Extract answers from selected paragraphs → `out/predictions.json`
+3. **Format Conversion**: Convert to Kaggle format → `out/submission.csv`
 
-流程會依序做：
+## Day 3 Progress
+- ✅ **psel**: Paragraph selection training and inference completed, generates `out/selected.json` (train/valid/test)
+- ✅ **span/train.py**: Supports No-Trainer training, BERT (bert-base-chinese) on Colab T4 running 2 epochs, valid F1 ≈ 85.55
+- ✅ **span/infer.py**: Inference on test set, generates `out/predictions.json`
+- ✅ **utils/format_kaggle.py**: Converts to Kaggle-compatible `submission.csv`
+- ✅ **run.sh**: Complete pipeline successfully integrated, one-click from data to submission file
 
-段落選擇 (psel) → 讀 context.json 和 test.json，挑一段 → out/selected.json
+Initial Kaggle submission (S0) completed, Public Leaderboard score: approximately 0.71.
 
-片段抽取 (span) → 在選段裡抓答案 → out/predictions.json
+## Requirements
+- Python 3.10
+- Key packages:
+  - transformers==4.50.0
+  - accelerate==0.34.2
+  - datasets==3.0.1
+  - evaluate==0.4.3
+  - tqdm==4.66.4
 
-格式轉換 → 轉成 Kaggle 要的 submission.csv → out/submission.csv
-
-
-Day2 完成進度
-
-新增 load_adl.py → 把 (question, paragraph) 轉成 多選題格式 [batch, num_choices, seq_len]
-
-訓練：在 Colab (T4 GPU) 跑 1 epoch BERT (bert-base-chinese)，存到 models/psel-best/
-
-推論：完成 psel/infer.py，能在 test.json 上輸出 out/selected.json
-
-run.sh 已可用真正的 BERT 段落選擇模型替代 dummy，pipeline 跑通到 submission.csv
-
-環境需求
-
-Python 3.10
-
-安裝套件：
-
-transformers==4.50.0
-accelerate==0.34.2
-datasets==3.0.1
-evaluate==0.4.3
-tqdm==4.66.4
-
-
-安裝方式：
-
+### Installation
+```bash
 pip install -r requirements.txt
+```
