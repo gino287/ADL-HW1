@@ -1,395 +1,458 @@
 # -*- coding: utf-8 -*-
-"""
-No-Trainer Extractive QA (BERT, Chinese)
-- 讀 out/selected.json（含 train/valid/test）
-- 建 start/end 監督，sliding window + offset 對齊
-- 進度條 tqdm，最佳 F1 自動存 models/span-best/ + meta.json
-"""
-
-import os, json, math, time, random, argparse, hashlib
+from __future__ import annotations
+import os, math, json, argparse, random, re
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict, Counter
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer, AutoModelForQuestionAnswering,
-    get_linear_schedule_with_warmup
-)
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from transformers import (
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
+    get_linear_schedule_with_warmup,
+)
 
-# ---------------- utils ----------------
-def set_seed(seed: int = 42):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+# ========== utils ==========
 
-def sha1_of_file(path: str) -> str:
-    h = hashlib.sha1()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(1<<16), b''):
-            h.update(chunk)
-    return h.hexdigest()
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def load_json(path):
-    with open(path, 'r', encoding='utf-8') as f:
+def load_json(p: str):
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def extract_answer_string(ex: dict) -> Optional[str]:
-    """
-    支援多種格式：
-      - ex['answer'] 是字串
-      - ex['answer'] 是物件，含 'text'
-      - ex['answers'] = {'text':[...]} 或 [{'text':...}]
-    """
-    if 'answer' in ex:
-        a = ex['answer']
-        if isinstance(a, str) and a.strip():
-            return a.strip()
-        if isinstance(a, dict) and isinstance(a.get('text'), str) and a['text'].strip():
-            return a['text'].strip()
-    if 'answers' in ex:
-        ans = ex['answers']
-        if isinstance(ans, dict) and 'text' in ans and len(ans['text'])>0:
-            s = str(ans['text'][0]).strip()
-            return s if s else None
-        if isinstance(ans, list) and len(ans)>0:
-            a0 = ans[0]
-            if isinstance(a0, dict) and 'text' in a0:
-                s = str(a0['text']).strip()
-                return s if s else None
+def get_id_and_question(ex: dict) -> Tuple[str, str]:
+    sid = str(ex.get("id", ex.get("qid", ex.get("uid"))))
+    q = str(ex.get("question", ex.get("q", ""))).strip()
+    return sid, q
+
+def extract_answer_texts(ex: dict) -> List[str]:
+    # 支援多種答案欄位格式
+    # {"answer": {"text": "..."}} / {"answer": "..."} / {"answers":{"text":["..."]}} / {"answers":[{"text":"..."}]}
+    if isinstance(ex.get("answer"), dict) and isinstance(ex["answer"].get("text"), str):
+        t = ex["answer"]["text"].strip()
+        return [t] if t else []
+    if isinstance(ex.get("answer"), str):
+        t = ex["answer"].strip()
+        return [t] if t else []
+    a2 = ex.get("answers")
+    if isinstance(a2, dict) and a2.get("text"):
+        if isinstance(a2["text"], list):
+            return [str(t).strip() for t in a2["text"] if str(t).strip()]
+        else:
+            t = str(a2["text"]).strip()
+            return [t] if t else []
+    if isinstance(a2, list) and a2:
+        outs = []
+        for a in a2:
+            if isinstance(a, dict) and "text" in a:
+                t = str(a["text"]).strip()
+                if t: outs.append(t)
+        return outs
+    return []
+
+def get_para_text_by_id(pid, context_db) -> Optional[str]:
+    if isinstance(context_db, dict):
+        return context_db.get(str(pid)) or context_db.get(pid)
+    if isinstance(context_db, list):
+        try: return context_db[int(pid)]
+        except Exception: return None
     return None
 
-def get_selected_context(sample_id: str, selected_obj, context_db) -> Optional[str]:
-    """
-    支援：
-      A) { "<id>": {"context": "..."} }
-      B) { "<id>": {"pid": <paragraph_id>} }（透過 context.json 查）
-      C) { "<id>": "<context string>" }
-    """
-    if sample_id not in selected_obj:
-        return None
-    entry = selected_obj[sample_id]
-    if isinstance(entry, dict):
-        if 'context' in entry and isinstance(entry['context'], str):
-            return entry['context']
-        if 'pid' in entry:
-            pid = entry['pid']
-            if isinstance(context_db, dict):
-                return context_db.get(str(pid)) or context_db.get(pid)
-            if isinstance(context_db, list):
-                try:
-                    return context_db[int(pid)]
-                except Exception:
-                    return None
-    elif isinstance(entry, str):
-        return entry
-    return None
+def normalize_para_ids_to_texts(paras, context_db) -> List[str]:
+    out = []
+    for p in paras:
+        if isinstance(p, (int, str)):
+            t = get_para_text_by_id(p, context_db)
+            if isinstance(t, str):
+                out.append(t)
+        elif isinstance(p, dict) and "text" in p:
+            out.append(p["text"])
+    return out
 
 @dataclass
 class QAExample:
     id: str
     question: str
     context: str
-    answer: Optional[str] = None  # train/valid 有，test 無
+    answer_text: str
+    answer_start: int  # char idx
+    answer_end: int    # char idx (exclusive)
 
-def build_examples(split_path: str, selected_path: str, context_path: str, require_answer: bool, limit: Optional[int]=None) -> List[QAExample]:
+def pick_oracle_context_and_span(ex: dict, ctx_db) -> Optional[Tuple[str, int, int, str]]:
+    """從候選段中挑出包含答案的那段，回傳 (context, start_char, end_char, answer_text)。"""
+    answers = extract_answer_texts(ex)
+    if not answers: return None
+    sid, q = get_id_and_question(ex)
+
+    # 候選段落：paragraphs/contexts/context
+    cands: List[str] = []
+    if "paragraphs" in ex and isinstance(ex["paragraphs"], list):
+        cands = normalize_para_ids_to_texts(ex["paragraphs"], ctx_db)
+    elif isinstance(ex.get("contexts"), list):
+        cands = normalize_para_ids_to_texts(ex["contexts"], ctx_db)
+    elif isinstance(ex.get("context"), str):
+        cands = [ex["context"]]
+
+    # 若有 relevant（id / 索引），優先取
+    if "relevant" in ex:
+        t = get_para_text_by_id(ex["relevant"], ctx_db)
+        if isinstance(t, str):
+            cands = [t] + [c for c in cands if c != t]
+
+    # 逐個答案嘗試匹配
+    for a in answers:
+        if not a: continue
+        for c in cands:
+            st = c.find(a)
+            if st != -1:
+                return c, st, st + len(a), a
+
+    # 找不到就放棄（可能資料不規則或答案不在候選）
+    return None
+
+def build_examples(split_path: str, context_path: str) -> List[QAExample]:
     data = load_json(split_path)
-    sel = load_json(selected_path)
     ctx_db = load_json(context_path)
-    examples = []
-    miss_ctx = 0
-    miss_ans = 0
-    iterable = data if isinstance(data, list) else data.get('data', [])
+    iterable = data if isinstance(data, list) else data.get("data", [])
+    out: List[QAExample] = []
+    miss = 0
     for ex in iterable:
-        sid = str(ex.get('id', ex.get('qid', ex.get('uid'))))
-        q   = str(ex.get('question', ex.get('q', ''))).strip()
-        if not sid or not q:
+        sid, q = get_id_and_question(ex)
+        picked = pick_oracle_context_and_span(ex, ctx_db)
+        if not picked:
+            miss += 1
             continue
-        ctx = get_selected_context(sid, sel, ctx_db)
-        if not ctx:
-            miss_ctx += 1
-            if require_answer:
-                continue
-            else:
-                ctx = ""
-        ans = extract_answer_string(ex)
-        if require_answer and not ans:
-            miss_ans += 1
-            continue
-        examples.append(QAExample(id=sid, question=q, context=ctx, answer=ans))
-        if limit and len(examples) >= limit:
-            break
-    if require_answer:
-        print(f"[build] loaded {len(examples)} examples | miss_ctx={miss_ctx} miss_ans={miss_ans}")
-    else:
-        print(f"[build] loaded {len(examples)} examples (test)")
-    return examples
+        ctx, s, e, a = picked
+        out.append(QAExample(sid, q, ctx, a, s, e))
+    print(f"[build] {split_path}: {len(out)} examples  (miss {miss})")
+    return out
 
-def char_em_f1(pred: str, gold: str) -> Tuple[float, float]:
-    pred = (pred or "").strip()
-    gold = (gold or "").strip()
-    if gold == "":
-        return (1.0 if pred=="" else 0.0, 1.0 if pred=="" else 0.0)
-    if pred == "":
-        return (0.0, 0.0)
-    if pred == gold:
-        return 1.0, 1.0
-    pc, gc = Counter(list(pred)), Counter(list(gold))
-    inter = sum((pc & gc).values())
-    prec = inter / max(1, len(pred))
-    rec  = inter / max(1, len(gold))
-    f1 = 0.0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
-    em = 1.0 if pred == gold else 0.0
-    return em, f1
+# ========== dataset ==========
 
-def decode_best_span(all_start, all_end, offset_mapping, max_answer_length=64):
-    best_score = -1e9; best = (0, 0)
-    k = min(20, all_start.shape[-1])
-    start_topk = torch.topk(all_start, k=k).indices.tolist()
-    end_topk   = torch.topk(all_end,   k=k).indices.tolist()
-    for s in start_topk:
-        for e in end_topk:
-            if e < s:
-                continue
-            if e - s + 1 > max_answer_length:
-                continue
-            score = all_start[s].item() + all_end[e].item()
-            if score > best_score:
-                best_score = score; best = (s, e)
-    s, e = best
-    os, _ = offset_mapping[s]
-    _, oe = offset_mapping[e]
-    return os, oe
+class SpanQADataset(Dataset):
+    def __init__(self,
+                 items: List[QAExample],
+                 tokenizer: AutoTokenizer,
+                 max_length: int,
+                 doc_stride: int,
+                 is_train: bool = True,
+                 max_answer_length: int = 64):
+        self.items = items
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.doc_stride = doc_stride
+        self.is_train = is_train
+        self.max_answer_length = max_answer_length
 
-# ---------------- main ----------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train", type=str, required=True)
-    parser.add_argument("--valid", type=str, required=True)
-    parser.add_argument("--context", type=str, required=True)
-    parser.add_argument("--selected", type=str, required=True)
-    parser.add_argument("--model", type=str, default="bert-base-chinese")
-    parser.add_argument("--output_dir", type=str, default="models/span-best")
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--bs", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--doc_stride", type=int, default=128)
-    parser.add_argument("--max_answer_length", type=int, default=64)
-    parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=2)
-    args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    set_seed(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[info] device: {device}")
-
-    # 1) 準備資料
-    train_examples = build_examples(args.train, args.selected, args.context, require_answer=True)
-    valid_examples = build_examples(args.valid, args.selected, args.context, require_answer=True)
-    print(f"[info] train: {len(train_examples)}, valid: {len(valid_examples)}")
-    assert len(train_examples) > 0 and len(valid_examples) > 0, "train/valid 為 0，請檢查 selected.json 與答案字段解析。"
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    model = AutoModelForQuestionAnswering.from_pretrained(args.model).to(device)
-
-    # 2) Feature 轉換（含 offset 映射）
-    def tokenize_examples(examples: List[QAExample], train_mode: bool):
-        questions = [e.question for e in examples]
-        contexts  = [e.context  for e in examples]
-        encoded = tokenizer(
-            questions, contexts,
+        # 先 tokenize 所有樣本（帶滑窗）
+        self.enc = self.tok(
+            [it.question for it in items],
+            [it.context  for it in items],
             truncation="only_second",
-            max_length=args.max_length,
-            stride=args.doc_stride,
+            max_length=max_length,
+            stride=doc_stride,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
             padding="max_length"
         )
-        sample_mapping = encoded.pop("overflow_to_sample_mapping")
-        offset_mapping = encoded["offset_mapping"]
-        start_positions = []
-        end_positions   = []
-        aligned = 0
-        for i, off in enumerate(offset_mapping):
-            if not train_mode:
-                start_positions.append(0); end_positions.append(0);
-                continue
-            sample_idx = sample_mapping[i]
-            answer = examples[sample_idx].answer or ""
-            context = examples[sample_idx].context or ""
+        self.sample_mapping = self.enc.pop("overflow_to_sample_mapping")
+        self.offset_mapping = self.enc["offset_mapping"]
 
-            ans_start_char = context.find(answer)
-            if ans_start_char < 0:
-                start_positions.append(0); end_positions.append(0)
-                continue
-            ans_end_char = ans_start_char + len(answer)
+        # 建立訓練標籤（start/end token index）
+        if is_train:
+            self.starts, self.ends = self._create_labels()
 
-            sequence_ids = encoded.sequence_ids(i)
-            idxs = [k for k, sid in enumerate(sequence_ids) if sid == 1]
-            if not idxs:
-                start_positions.append(0); end_positions.append(0);
-                continue
-            ctx_start, ctx_end = idxs[0], idxs[-1]
+    def __len__(self): return len(self.enc["input_ids"])
 
-            token_start = token_end = None
-            for k in range(ctx_start, ctx_end+1):
-                s, e = off[k]
-                if s <= ans_start_char < e:
-                    token_start = k
-                if s <  ans_end_char <= e:
-                    token_end = k
-                if token_start is not None and token_end is not None:
+    def __getitem__(self, i):
+        item = {k: torch.tensor(v[i]) for k, v in self.enc.items() if k != "offset_mapping"}
+        if self.is_train:
+            item["start_positions"] = torch.tensor(self.starts[i])
+            item["end_positions"]   = torch.tensor(self.ends[i])
+        return item
+
+    def _create_labels(self):
+        starts, ends = [], []
+        for i in range(len(self.enc["input_ids"])):
+            smp_idx = self.sample_mapping[i]
+            it      = self.items[smp_idx]
+            offsets = self.offset_mapping[i]
+
+            # 找到答案的 token 索引範圍
+            start_char, end_char = it.answer_start, it.answer_end
+            start_tok, end_tok = 0, 0
+
+            # 若該 window 完全沒覆蓋到答案，就標成 CLS（讓模型學到負例）
+            contains = False
+            for idx, (s_off, e_off) in enumerate(offsets):
+                if s_off is None or e_off is None:  # special tokens
+                    continue
+                if s_off <= start_char and end_char <= e_off:
+                    # 完整包住答案的單 token（非常短答案）
+                    start_tok = end_tok = idx
+                    contains = True
                     break
-            if token_start is None or token_end is None:
-                start_positions.append(0); end_positions.append(0)
-            else:
-                start_positions.append(token_start); end_positions.append(token_end)
-                aligned += 1
+                # 找 start/end 落在哪些 token
+                if s_off <= start_char < e_off:
+                    start_tok = idx
+                if s_off < end_char <= e_off:
+                    end_tok = idx
+                    contains = True
 
-        encoded["start_positions"] = start_positions
-        encoded["end_positions"]   = end_positions
-        encoded["overflow_to_sample_mapping"] = sample_mapping
-        encoded["offset_mapping"] = offset_mapping
-        if train_mode:
-            total = len(offset_mapping)
-            print(f"[align] {aligned}/{total} features aligned to gold span ({aligned/total*100:.1f}%)")
-        return encoded
+            if not contains:
+                # 將 start/end 指到 CLS（通常 index=0），HuggingFace 會處理這種負例
+                cls_index = self.enc["input_ids"][i].index(self.tok.cls_token_id) \
+                            if self.tok.cls_token_id in self.enc["input_ids"][i] else 0
+                starts.append(cls_index)
+                ends.append(cls_index)
+                continue
 
-    train_feats = tokenize_examples(train_examples, train_mode=True)
-    valid_feats = tokenize_examples(valid_examples, train_mode=True)
+            # 長度限制
+            if end_tok - start_tok + 1 > self.max_answer_length:
+                end_tok = start_tok + self.max_answer_length - 1
+                end_tok = max(end_tok, start_tok)
 
-    class QADataset(torch.utils.data.Dataset):
-        def __init__(self, enc): self.enc = enc
-        def __len__(self): return len(self.enc["input_ids"])
-        def __getitem__(self, idx):
-            return {k: torch.tensor(v[idx]) for k, v in self.enc.items() if k not in []}
+            starts.append(start_tok)
+            ends.append(end_tok)
+        return starts, ends
 
-    train_loader = DataLoader(QADataset(train_feats), batch_size=args.bs, shuffle=True,  num_workers=args.num_workers)
-    valid_loader = DataLoader(QADataset(valid_feats), batch_size=args.bs, shuffle=False, num_workers=args.num_workers)
+# ========== metrics ==========
 
-    # 3) Optim / Scheduler / AMP
-    optim = AdamW(model.parameters(), lr=args.lr)
-    num_update_steps_per_epoch = math.ceil(len(train_loader) / max(1, args.grad_accum))
-    max_train_steps = args.epochs * num_update_steps_per_epoch
-    sched = get_linear_schedule_with_warmup(
-        optim, num_warmup_steps=int(0.1*max_train_steps), num_training_steps=max_train_steps
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda"))
+def _normalize_text(s: str) -> str:
+    s = s.strip()
+    # 保留中文標點，不過度清洗；只壓空白
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    best_f1 = -1.0
+def compute_em_f1(pred: str, golds: List[str]) -> Tuple[float, float]:
+    pred_n = _normalize_text(pred)
+    golds_n = [_normalize_text(g) for g in golds if g is not None]
+    if any(pred_n == g for g in golds_n):
+        return 1.0, 1.0
+    # F1（字級或空白分詞）；中文用「逐字」比較穩
+    def to_units(x: str): return list(x)
+    p_set = to_units(pred_n)
+    best_f1 = 0.0
+    for g in golds_n:
+        g_set = to_units(g)
+        common = 0
+        # 計算 multiset 交集
+        used = [False]*len(g_set)
+        for ch in p_set:
+            for j, gh in enumerate(g_set):
+                if (not used[j]) and gh == ch:
+                    used[j] = True
+                    common += 1
+                    break
+        if common == 0:
+            f1 = 0.0
+        else:
+            prec = common / max(1, len(p_set))
+            rec  = common / max(1, len(g_set))
+            f1 = 2*prec*rec/(prec+rec)
+        best_f1 = max(best_f1, f1)
+    return 0.0, best_f1
 
-    def evaluate():
-        model.eval()
-        total_loss = 0.0; n = 0
-        with torch.no_grad():
-            for batch in DataLoader(QADataset(valid_feats), batch_size=args.bs, shuffle=False, num_workers=0):
-                for k in ["input_ids","attention_mask","token_type_ids","start_positions","end_positions"]:
-                    if k in batch: batch[k] = batch[k].to(device)
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    token_type_ids=batch.get("token_type_ids", None),
-                    start_positions=batch["start_positions"],
-                    end_positions=batch["end_positions"]
+@torch.no_grad()
+def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_answer_length: int) -> Tuple[float, float]:
+    model.eval()
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    sample_map = dataset.sample_mapping
+    offsets    = dataset.offset_mapping
+    items      = dataset.items
+
+    # 對每個樣本（含多窗）擇最佳 span
+    best_for_id: Dict[str, Tuple[float, str]] = {}
+    for batch_idx, batch in enumerate(dl):
+        input_ids = batch["input_ids"].to(device)
+        attn_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+        else:
+            token_type_ids = token_type_ids.to(device)
+
+        out = model(input_ids=input_ids, attention_mask=attn_mask, token_type_ids=token_type_ids, return_dict=True)
+        s_logits = out.start_logits.detach().cpu()
+        e_logits = out.end_logits.detach().cpu()
+
+        B = s_logits.size(0)
+        for j in range(B):
+            gidx = batch_idx*dl.batch_size + j
+            smp  = sample_map[gidx]
+            it   = items[smp]
+            off  = offsets[gidx]
+            # 從 logits 解最優 span
+            k = min(20, s_logits.shape[1])
+            s_top = torch.topk(s_logits[j], k=k).indices.tolist()
+            e_top = torch.topk(e_logits[j], k=k).indices.tolist()
+            best_s, best_e, best_score = 0, 0, -1e9
+            for s in s_top:
+                for e in e_top:
+                    if e < s: continue
+                    if e - s + 1 > max_answer_length: continue
+                    score = s_logits[j][s].item() + e_logits[j][e].item()
+                    if score > best_score:
+                        best_s, best_e, best_score = s, e, score
+            s_char, _ = off[best_s]
+            _, e_char = off[best_e]
+            pred_text = it.context[s_char:e_char].strip()
+            old = best_for_id.get(it.id, (-1e9, ""))
+            if best_score > old[0]:
+                best_for_id[it.id] = (best_score, pred_text)
+
+    # 匹配 gold，算 EM / F1
+    em_sum, f1_sum, n = 0.0, 0.0, 0
+    for it in items:
+        if it.id not in best_for_id:  # 理論上不會
+            continue
+        pred = best_for_id[it.id][1]
+        _, f1 = compute_em_f1(pred, [it.answer_text])
+        em = 1.0 if _normalize_text(pred) == _normalize_text(it.answer_text) else 0.0
+        em_sum += em; f1_sum += f1; n += 1
+    model.train()
+    return em_sum / max(1, n), f1_sum / max(1, n)
+
+# ========== train ==========
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    # data
+    ap.add_argument("--train", type=str, required=True)
+    ap.add_argument("--valid", type=str, required=True)
+    ap.add_argument("--context", type=str, required=True)
+    # model
+    ap.add_argument("--model", type=str, default="hfl/chinese-roberta-wwm-ext")
+    ap.add_argument("--output_dir", type=str, default="models/span-best")
+    # hparams
+    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--bs", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=3e-5)
+    ap.add_argument("--weight_decay", type=float, default=0.01)
+    ap.add_argument("--warmup_ratio", type=float, default=0.1)
+    ap.add_argument("--grad_accum", type=int, default=1)
+    ap.add_argument("--clip_grad", type=float, default=1.0)
+    ap.add_argument("--max_length", type=int, default=512)
+    ap.add_argument("--doc_stride", type=int, default=128)
+    ap.add_argument("--max_answer_length", type=int, default=64)
+    # misc
+    ap.add_argument("--eval_every", type=int, default=1000)  # 依資料量調整；0 表每 epoch 評估
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--num_workers", type=int, default=2)
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # tokenizer & data
+    tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    train_items = build_examples(args.train, args.context)
+    valid_items = build_examples(args.valid, args.context)
+
+    train_ds = SpanQADataset(train_items, tok, args.max_length, args.doc_stride, is_train=True,  max_answer_length=args.max_answer_length)
+    valid_ds = SpanQADataset(valid_items, tok, args.max_length, args.doc_stride, is_train=False, max_answer_length=args.max_answer_length)
+
+    train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True,  num_workers=args.num_workers)
+    valid_dl = DataLoader(valid_ds, batch_size=max(2, args.bs), shuffle=False, num_workers=args.num_workers)
+
+    # model / optim / sched
+    model = AutoModelForQuestionAnswering.from_pretrained(args.model).to(device)
+
+    no_decay = ["bias", "LayerNorm.weight"]
+    param_groups = [
+        {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         "weight_decay": args.weight_decay},
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    optim = AdamW(param_groups, lr=args.lr)
+
+    num_update_per_epoch = math.ceil(len(train_dl) / args.grad_accum)
+    tot_updates = args.epochs * num_update_per_epoch
+    warmups = int(tot_updates * args.warmup_ratio)
+    sched = get_linear_schedule_with_warmup(optim, num_warmup_steps=warmups, num_training_steps=tot_updates)
+
+    scaler = GradScaler()
+    model.train()
+
+    best_f1, best_path = -1.0, os.path.join(args.output_dir, "best")
+
+    global_step, running = 0, 0.0
+    optim.zero_grad(set_to_none=True)
+
+    for ep in range(1, args.epochs + 1):
+        for step, batch in enumerate(train_dl, start=1):
+            input_ids = batch["input_ids"].to(device)
+            attn      = batch["attention_mask"].to(device)
+            ttype     = batch.get("token_type_ids")
+            if ttype is None:
+                ttype = torch.zeros_like(input_ids)
+            ttype     = ttype.to(device)
+            start_pos = batch["start_positions"].to(device)
+            end_pos   = batch["end_positions"].to(device)
+
+            with autocast():
+                out  = model(
+                    input_ids=input_ids,
+                    attention_mask=attn,
+                    token_type_ids=ttype,
+                    start_positions=start_pos,
+                    end_positions=end_pos,
+                    return_dict=True
                 )
-                total_loss += outputs.loss.item(); n += 1
-        avg_loss = total_loss/max(1,n)
+                loss = out.loss / args.grad_accum
 
-        # 解碼 EM/F1
-        all_preds = defaultdict(list)
-        with torch.no_grad():
-            for i in range(0, len(valid_feats["input_ids"]), args.bs):
-                sl = slice(i, i+args.bs)
-                input_ids = torch.tensor(valid_feats["input_ids"][sl]).to(device)
-                attn_mask = torch.tensor(valid_feats["attention_mask"][sl]).to(device)
-                token_type_ids = torch.tensor(valid_feats.get("token_type_ids", [0]*len(valid_feats["input_ids"]))[sl]).to(device)
-                out = model(input_ids=input_ids, attention_mask=attn_mask, token_type_ids=token_type_ids, return_dict=True)
-                start_logits = out.start_logits.detach().cpu()
-                end_logits   = out.end_logits.detach().cpu()
-                sample_mapping = valid_feats["overflow_to_sample_mapping"][sl]
-                for j in range(start_logits.shape[0]):
-                    smp_idx = sample_mapping[j]
-                    ex = valid_examples[smp_idx]
-                    offsets = valid_feats["offset_mapping"][i+j]
-                    s_char, e_char = decode_best_span(start_logits[j], end_logits[j], offsets, args.max_answer_length)
-                    pred_text = ex.context[s_char:e_char]
-                    all_preds[ex.id].append(pred_text)
-
-        ems, f1s = [], []
-        for ex in valid_examples:
-            cand_list = all_preds.get(ex.id, [""])
-            cand_list = sorted(cand_list, key=lambda s: len(s), reverse=True)
-            pred = cand_list[0] if cand_list else ""
-            em, f1 = char_em_f1(pred, ex.answer or "")
-            ems.append(em); f1s.append(f1)
-        EM = float(np.mean(ems))*100.0
-        F1 = float(np.mean(f1s))*100.0
-        return avg_loss, EM, F1
-
-    # 4) 訓練迴圈（tqdm 進度條 + 自動存檔 best）
-    global_step = 0
-    for epoch in range(1, args.epochs+1):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"Train {epoch}/{args.epochs}", unit="batch")
-        run_loss = 0.0
-        optim.zero_grad(set_to_none=True)
-        for step, batch in enumerate(pbar, start=1):
-            for k in ["input_ids","attention_mask","token_type_ids","start_positions","end_positions"]:
-                if k in batch: batch[k] = batch[k].to(device)
-            with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    token_type_ids=batch.get("token_type_ids", None),
-                    start_positions=batch["start_positions"],
-                    end_positions=batch["end_positions"]
-                )
-                loss = outputs.loss / max(1, args.grad_accum)
             scaler.scale(loss).backward()
+            running += loss.item()
+
             if step % args.grad_accum == 0:
-                scaler.step(optim); scaler.update(); sched.step()
-                optim.zero_grad(set_to_none=True); global_step += 1
-            run_loss += loss.item()
-            pbar.set_postfix(loss=f"{run_loss/step:.4f}")
+                scaler.unscale_(optim)
+                if args.clip_grad and args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad(set_to_none=True)
+                sched.step()
+                global_step += 1
 
-        v_loss, v_em, v_f1 = evaluate()
-        print(f"[valid] epoch {epoch} | loss {v_loss:.4f} | EM {v_em:.2f} | F1 {v_f1:.2f}")
+                if global_step % 20 == 0:
+                    lr_now = sched.get_last_lr()[0]
+                    print(f"[epoch {ep}] update {global_step}/{tot_updates} loss={running/20:.4f} lr={lr_now:.2e}")
+                    running = 0.0
 
-        if v_f1 > best_f1:
-            best_f1 = v_f1
-            print(f"[save] new best F1={best_f1:.2f} → {args.output_dir}")
-            tokenizer.save_pretrained(args.output_dir)
-            model.save_pretrained(args.output_dir)
-            meta = {
-                "model_name": args.model,
-                "epochs_trained": epoch,
-                "batch_size": args.bs,
-                "lr": args.lr,
-                "max_length": args.max_length,
-                "doc_stride": args.doc_stride,
-                "max_answer_length": args.max_answer_length,
-                "grad_accum": args.grad_accum,
-                "seed": args.seed,
-                "valid_em": v_em,
-                "valid_f1": v_f1,
-                "train_json": args.train,
-                "valid_json": args.valid,
-                "context_json": args.context,
-                "selected_json": args.selected,
-                "selected_sha1": sha1_of_file(args.selected) if os.path.exists(args.selected) else None,
-                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            with open(os.path.join(args.output_dir, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
+                if args.eval_every > 0 and (global_step % args.eval_every == 0):
+                    em, f1 = evaluate(model, tok, valid_ds, max(2, args.bs), device, args.max_answer_length)
+                    print(f"[eval@step {global_step}] valid EM={em:.4f} F1={f1:.4f}")
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        model.save_pretrained(best_path)
+                        tok.save_pretrained(best_path)
+                        print(f"[save] new best F1={best_f1:.4f} → {best_path}")
 
-    print(f"[done] best F1: {best_f1:.2f} | saved at {args.output_dir}")
+        if args.eval_every == 0:
+            em, f1 = evaluate(model, tok, valid_ds, max(2, args.bs), device, args.max_answer_length)
+            print(f"[eval@epoch {ep}] valid EM={em:.4f} F1={f1:.4f}")
+            if f1 > best_f1:
+                best_f1 = f1
+                model.save_pretrained(best_path)
+                tok.save_pretrained(best_path)
+                print(f"[save] new best F1={best_f1:.4f} → {best_path}")
+
+    if best_f1 < 0:
+        # 至少留一份
+        model.save_pretrained(best_path)
+        tok.save_pretrained(best_path)
+        best_f1 = 0.0
+
+    print(f"[OK] finished training. best valid F1={best_f1:.4f}, saved to {best_path}")
 
 if __name__ == "__main__":
-  main()
-
+    main()
