@@ -49,7 +49,6 @@ from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 # NEW: 用你自己的 Dataset / Collate
-from torch.utils.data import DataLoader
 from dataio.load_adl import ADLPselDataset, psel_collate
 
 
@@ -236,6 +235,12 @@ def parse_args():
                         help="Path to context.json (pid -> paragraph text).")
     parser.add_argument("--fixed_k", type=int, default=4,
                         help="Fix the number of choices per question (e.g., 4 or 8).")
+    parser.add_argument(
+    "--eval_steps",
+    type=int,
+    default=1000,
+    help="Run validation every N training steps; set to 0 to disable step-based eval."
+)
 
     args = parser.parse_args()
 
@@ -472,6 +477,52 @@ def main():
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
+    
+    # ---- Best-checkpoint tracking & eval helper ----
+    # 放在 accelerator.prepare(...) 之後
+    best_acc = -1.0
+    last_val_acc = float("nan")
+    best_path = os.path.join(args.output_dir, "best")
+    os.makedirs(best_path, exist_ok=True)
+
+    def evaluate_and_maybe_save(tag: str) -> float:
+        nonlocal best_acc, last_val_acc
+        model.eval()
+
+        # 每次評估各自建一個 metric，避免殘留
+        val_metric = evaluate.load("accuracy")
+
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                outputs = model(**batch)
+            preds = outputs.logits.argmax(dim=-1)
+            preds, refs = accelerator.gather_for_metrics((preds, batch["labels"]))
+            val_metric.add_batch(predictions=preds, references=refs)
+
+        eval_metric = val_metric.compute()
+        val_acc = float(eval_metric["accuracy"])
+        last_val_acc = val_acc
+
+        accelerator.print(f"[eval@{tag}] valid MC-acc = {val_acc:.4f}")
+
+        # 只有更好才存 best
+        if val_acc > best_acc:
+            best_acc = val_acc
+            accelerator.print(f"[save] new best acc={val_acc:.4f} \u2192 {best_path}")
+            accelerator.wait_for_everyone()
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.save_pretrained(
+                best_path,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(best_path)
+
+        return val_acc
+
+    # -----------------------------------------------
+
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -552,6 +603,8 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
+
+
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
                 outputs = model(**batch)
@@ -579,30 +632,19 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
-            metric.add_batch(
-                predictions=predictions,
-                references=references,
-            )
-
-        eval_metric = metric.compute()
-        accelerator.print(f"epoch {epoch}: {eval_metric}")
+        val_acc = evaluate_and_maybe_save(tag=f"epoch {epoch}")
 
         if args.with_tracking:
             accelerator.log(
                 {
-                    "accuracy": eval_metric,
-                    "train_loss": total_loss.item() / len(train_dataloader),
+                    "accuracy": val_acc,   # 改這行
+                    "train_loss": (total_loss.item() / len(train_dataloader)) if len(train_dataloader) > 0 else float("nan"),
                     "epoch": epoch,
                     "step": completed_steps,
                 },
                 step=completed_steps,
             )
+
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -642,7 +684,11 @@ def main():
                     repo_type="model",
                     token=args.hub_token,
                 )
-            all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
+            # 若整程只做了 step-based eval 而沒跑 epoch-end 的那次，補一個最後評估
+            if (last_val_acc != last_val_acc):  # NaN 檢查
+                last_val_acc = evaluate_and_maybe_save(tag="final")
+
+            all_results = {"eval_accuracy": float(last_val_acc)}
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 json.dump(all_results, f)
 
