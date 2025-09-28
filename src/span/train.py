@@ -32,7 +32,6 @@ def get_id_and_question(ex: dict) -> Tuple[str, str]:
 
 def extract_answer_texts(ex: dict) -> List[str]:
     # 支援多種答案欄位格式
-    # {"answer": {"text": "..."}} / {"answer": "..."} / {"answers":{"text":["..."]}} / {"answers":[{"text":"..."}]}
     if isinstance(ex.get("answer"), dict) and isinstance(ex["answer"].get("text"), str):
         t = ex["answer"]["text"].strip()
         return [t] if t else []
@@ -83,52 +82,63 @@ class QAExample:
     answer_start: int  # char idx
     answer_end: int    # char idx (exclusive)
 
-def pick_oracle_context_and_span(ex: dict, ctx_db) -> Optional[Tuple[str, int, int, str]]:
-    """從候選段中挑出包含答案的那段，回傳 (context, start_char, end_char, answer_text)。"""
-    answers = extract_answer_texts(ex)
-    if not answers: return None
-    sid, q = get_id_and_question(ex)
-
-    # 候選段落：paragraphs/contexts/context
-    cands: List[str] = []
-    if "paragraphs" in ex and isinstance(ex["paragraphs"], list):
-        cands = normalize_para_ids_to_texts(ex["paragraphs"], ctx_db)
-    elif isinstance(ex.get("contexts"), list):
-        cands = normalize_para_ids_to_texts(ex["contexts"], ctx_db)
-    elif isinstance(ex.get("context"), str):
-        cands = [ex["context"]]
-
-    # 若有 relevant（id / 索引），優先取
-    if "relevant" in ex:
-        t = get_para_text_by_id(ex["relevant"], ctx_db)
-        if isinstance(t, str):
-            cands = [t] + [c for c in cands if c != t]
-
-    # 逐個答案嘗試匹配
+def _first_hit_span(contexts: List[str], answers: List[str]) -> Optional[Tuple[str,int,int,str]]:
+    """在多個候選段中找出第一個包含任一答案字串的 (ctx, s, e, ans)。"""
     for a in answers:
-        if not a: continue
-        for c in cands:
-            st = c.find(a)
-            if st != -1:
-                return c, st, st + len(a), a
-
-    # 找不到就放棄（可能資料不規則或答案不在候選）
+        if not a: 
+            continue
+        for c in contexts:
+            pos = c.find(a)
+            if pos != -1:
+                return c, pos, pos + len(a), a
     return None
 
-def build_examples(split_path: str, context_path: str) -> List[QAExample]:
+def build_examples(split_path: str,
+                   context_path: str,
+                   psel_kv: Optional[Dict[str, Dict[str, List[str]]]] = None,
+                   use_psel_only: bool = False) -> List[QAExample]:
+    """優先用 psel 選出的段落（文字串），否則回退到原始的 paragraphs/contexts/context。"""
     data = load_json(split_path)
     ctx_db = load_json(context_path)
     iterable = data if isinstance(data, list) else data.get("data", [])
     out: List[QAExample] = []
     miss = 0
+
     for ex in iterable:
         sid, q = get_id_and_question(ex)
-        picked = pick_oracle_context_and_span(ex, ctx_db)
-        if not picked:
+        answers = extract_answer_texts(ex)
+        if not answers:
             miss += 1
             continue
-        ctx, s, e, a = picked
+
+        # 先嘗試用 psel 選出來的
+        cands: List[str] = []
+        if psel_kv is not None and sid in psel_kv:
+            cands = list(psel_kv[sid].get("paragraphs", []) or [])
+
+        # 不夠就回退到原始欄位
+        if (not cands) and (not use_psel_only):
+            if "paragraphs" in ex and isinstance(ex["paragraphs"], list):
+                cands = normalize_para_ids_to_texts(ex["paragraphs"], ctx_db)
+            elif isinstance(ex.get("contexts"), list):
+                cands = normalize_para_ids_to_texts(ex["contexts"], ctx_db)
+            elif isinstance(ex.get("context"), str):
+                cands = [ex["context"]]
+
+        # relevant（id/索引）在回退時優先
+        if (not cands) and (not use_psel_only) and ("relevant" in ex):
+            t = get_para_text_by_id(ex["relevant"], ctx_db)
+            if isinstance(t, str):
+                cands = [t]
+
+        hit = _first_hit_span(cands, answers)
+        if not hit:
+            miss += 1
+            continue
+
+        ctx, s, e, a = hit
         out.append(QAExample(sid, q, ctx, a, s, e))
+
     print(f"[build] {split_path}: {len(out)} examples  (miss {miss})")
     return out
 
@@ -149,7 +159,6 @@ class SpanQADataset(Dataset):
         self.is_train = is_train
         self.max_answer_length = max_answer_length
 
-        # 先 tokenize 所有樣本（帶滑窗）
         self.enc = self.tok(
             [it.question for it in items],
             [it.context  for it in items],
@@ -158,16 +167,18 @@ class SpanQADataset(Dataset):
             stride=doc_stride,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
-            padding="max_length"
+            padding="max_length",
+            return_token_type_ids=True,
         )
         self.sample_mapping = self.enc.pop("overflow_to_sample_mapping")
-        self.offset_mapping = self.enc["offset_mapping"]
+        self.offset_mapping = self.enc["offset_mapping"]  # list of list[(start,end)]
 
-        # 建立訓練標籤（start/end token index）
+        # 建 label（僅訓練用）
         if is_train:
             self.starts, self.ends = self._create_labels()
 
-    def __len__(self): return len(self.enc["input_ids"])
+    def __len__(self): 
+        return len(self.enc["input_ids"])
 
     def __getitem__(self, i):
         item = {k: torch.tensor(v[i]) for k, v in self.enc.items() if k != "offset_mapping"}
@@ -182,50 +193,48 @@ class SpanQADataset(Dataset):
             smp_idx = self.sample_mapping[i]
             it      = self.items[smp_idx]
             offsets = self.offset_mapping[i]
+            seq_ids = self.enc.sequence_ids(i)  # None/0(question)/1(context)
 
-            # 找到答案的 token 索引範圍
-            start_char, end_char = it.answer_start, it.answer_end
-            start_tok, end_tok = 0, 0
-
-            # 若該 window 完全沒覆蓋到答案，就標成 CLS（讓模型學到負例）
-            contains = False
-            for idx, (s_off, e_off) in enumerate(offsets):
-                if s_off is None or e_off is None:  # special tokens
-                    continue
-                if s_off <= start_char and end_char <= e_off:
-                    # 完整包住答案的單 token（非常短答案）
-                    start_tok = end_tok = idx
-                    contains = True
-                    break
-                # 找 start/end 落在哪些 token
-                if s_off <= start_char < e_off:
-                    start_tok = idx
-                if s_off < end_char <= e_off:
-                    end_tok = idx
-                    contains = True
-
-            if not contains:
-                # 將 start/end 指到 CLS（通常 index=0），HuggingFace 會處理這種負例
+            # 僅考慮 context 的 token，避免 special/question 影響
+            valid_idx = [k for k, sid in enumerate(seq_ids) if sid == 1 and offsets[k] is not None]
+            if not valid_idx:
                 cls_index = self.enc["input_ids"][i].index(self.tok.cls_token_id) \
                             if self.tok.cls_token_id in self.enc["input_ids"][i] else 0
-                starts.append(cls_index)
-                ends.append(cls_index)
-                continue
+                starts.append(cls_index); ends.append(cls_index); continue
 
-            # 長度限制
+            start_char, end_char = it.answer_start, it.answer_end
+            start_tok, end_tok = None, None
+
+            for k in valid_idx:
+                s_off, e_off = offsets[k]
+                if s_off is None or e_off is None: 
+                    continue
+                if start_tok is None and s_off <= start_char < e_off:
+                    start_tok = k
+                if end_tok is None and s_off < end_char <= e_off:
+                    end_tok = k
+                # 極短答案可能被單一 token 完整包住
+                if s_off <= start_char and end_char <= e_off:
+                    start_tok = end_tok = k
+                    break
+
+            if start_tok is None or end_tok is None:
+                cls_index = self.enc["input_ids"][i].index(self.tok.cls_token_id) \
+                            if self.tok.cls_token_id in self.enc["input_ids"][i] else 0
+                starts.append(cls_index); ends.append(cls_index); continue
+
+            # answer 長度上限
             if end_tok - start_tok + 1 > self.max_answer_length:
                 end_tok = start_tok + self.max_answer_length - 1
                 end_tok = max(end_tok, start_tok)
 
-            starts.append(start_tok)
-            ends.append(end_tok)
+            starts.append(start_tok); ends.append(end_tok)
         return starts, ends
 
 # ========== metrics ==========
 
 def _normalize_text(s: str) -> str:
     s = s.strip()
-    # 保留中文標點，不過度清洗；只壓空白
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -234,14 +243,12 @@ def compute_em_f1(pred: str, golds: List[str]) -> Tuple[float, float]:
     golds_n = [_normalize_text(g) for g in golds if g is not None]
     if any(pred_n == g for g in golds_n):
         return 1.0, 1.0
-    # F1（字級或空白分詞）；中文用「逐字」比較穩
-    def to_units(x: str): return list(x)
+    def to_units(x: str): return list(x)  # 中文用逐字
     p_set = to_units(pred_n)
     best_f1 = 0.0
     for g in golds_n:
         g_set = to_units(g)
         common = 0
-        # 計算 multiset 交集
         used = [False]*len(g_set)
         for ch in p_set:
             for j, gh in enumerate(g_set):
@@ -266,7 +273,6 @@ def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_an
     offsets    = dataset.offset_mapping
     items      = dataset.items
 
-    # 對每個樣本（含多窗）擇最佳 span
     best_for_id: Dict[str, Tuple[float, str]] = {}
     for batch_idx, batch in enumerate(dl):
         input_ids = batch["input_ids"].to(device)
@@ -287,10 +293,18 @@ def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_an
             smp  = sample_map[gidx]
             it   = items[smp]
             off  = offsets[gidx]
-            # 從 logits 解最優 span
-            k = min(20, s_logits.shape[1])
-            s_top = torch.topk(s_logits[j], k=k).indices.tolist()
-            e_top = torch.topk(e_logits[j], k=k).indices.tolist()
+            # 只挑有 offset 的 token，避免選到 special
+            valid_idx = [k for k, (s_off, e_off) in enumerate(off) if (s_off is not None and e_off is not None and not (s_off == 0 and e_off == 0))]
+            if not valid_idx:
+                continue
+
+            # 取前k名組合尋優
+            k = min(20, len(off))
+            s_top = torch.topk(s_logits[j][valid_idx], k=min(k, len(valid_idx))).indices.tolist()
+            e_top = torch.topk(e_logits[j][valid_idx], k=min(k, len(valid_idx))).indices.tolist()
+            s_top = [valid_idx[idx] for idx in s_top]
+            e_top = [valid_idx[idx] for idx in e_top]
+
             best_s, best_e, best_score = 0, 0, -1e9
             for s in s_top:
                 for e in e_top:
@@ -299,6 +313,7 @@ def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_an
                     score = s_logits[j][s].item() + e_logits[j][e].item()
                     if score > best_score:
                         best_s, best_e, best_score = s, e, score
+
             s_char, _ = off[best_s]
             _, e_char = off[best_e]
             pred_text = it.context[s_char:e_char].strip()
@@ -306,10 +321,9 @@ def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_an
             if best_score > old[0]:
                 best_for_id[it.id] = (best_score, pred_text)
 
-    # 匹配 gold，算 EM / F1
     em_sum, f1_sum, n = 0.0, 0.0, 0
     for it in items:
-        if it.id not in best_for_id:  # 理論上不會
+        if it.id not in best_for_id:
             continue
         pred = best_for_id[it.id][1]
         _, f1 = compute_em_f1(pred, [it.answer_text])
@@ -326,6 +340,11 @@ def parse_args():
     ap.add_argument("--train", type=str, required=True)
     ap.add_argument("--valid", type=str, required=True)
     ap.add_argument("--context", type=str, required=True)
+    # optional: psel selected（KV 格式：{id: {"paragraphs": [...]}}）
+    ap.add_argument("--psel_selected", type=str, default=None,
+                    help="使用段落選結果來限制候選（建議給 out/psel_selected_all.json）")
+    ap.add_argument("--use_psel_only", action="store_true",
+                    help="只用 psel 段落，不回退到原始 paragraphs/contexts/context")
     # model
     ap.add_argument("--model", type=str, default="hfl/chinese-roberta-wwm-ext")
     ap.add_argument("--output_dir", type=str, default="models/span-best")
@@ -341,7 +360,7 @@ def parse_args():
     ap.add_argument("--doc_stride", type=int, default=128)
     ap.add_argument("--max_answer_length", type=int, default=64)
     # misc
-    ap.add_argument("--eval_every", type=int, default=1000)  # 依資料量調整；0 表每 epoch 評估
+    ap.add_argument("--eval_every", type=int, default=1000)  # 0 = 每個 epoch 評估一次
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
     return ap.parse_args()
@@ -352,15 +371,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # 讀 psel 選段（可選）
+    psel_kv = load_json(args.psel_selected) if args.psel_selected else None
+
     # tokenizer & data
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    train_items = build_examples(args.train, args.context)
-    valid_items = build_examples(args.valid, args.context)
+    train_items = build_examples(args.train, args.context, psel_kv, args.use_psel_only)
+    valid_items = build_examples(args.valid, args.context, psel_kv, args.use_psel_only)
 
     train_ds = SpanQADataset(train_items, tok, args.max_length, args.doc_stride, is_train=True,  max_answer_length=args.max_answer_length)
     valid_ds = SpanQADataset(valid_items, tok, args.max_length, args.doc_stride, is_train=False, max_answer_length=args.max_answer_length)
 
     train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True,  num_workers=args.num_workers)
+    # eval 用較大的 batch
     valid_dl = DataLoader(valid_ds, batch_size=max(2, args.bs), shuffle=False, num_workers=args.num_workers)
 
     # model / optim / sched

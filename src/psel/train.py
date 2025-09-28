@@ -49,7 +49,7 @@ from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 # NEW: 用你自己的 Dataset / Collate
-from dataio.load_adl import ADLPselDataset, psel_collate
+from src.dataio.load_adl import ADLPselDataset, psel_collate
 
 
 import transformers
@@ -477,7 +477,10 @@ def main():
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
-    
+    # 只挑模型 forward 吃得下的 keys
+    MODEL_KEYS = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+    def to_model_inputs(batch):
+        return {k: v for k, v in batch.items() if k in MODEL_KEYS}
     # ---- Best-checkpoint tracking & eval helper ----
     # 放在 accelerator.prepare(...) 之後
     best_acc = -1.0
@@ -494,7 +497,7 @@ def main():
 
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                outputs = model(**batch)
+                outputs = model(**to_model_inputs(batch))
             preds = outputs.logits.argmax(dim=-1)
             preds, refs = accelerator.gather_for_metrics((preds, batch["labels"]))
             val_metric.add_batch(predictions=preds, references=refs)
@@ -607,7 +610,7 @@ def main():
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
-                outputs = model(**batch)
+                outputs = model(**to_model_inputs(batch))
                 loss = outputs.loss
                 # We keep track of the loss at each epoch
                 if args.with_tracking:

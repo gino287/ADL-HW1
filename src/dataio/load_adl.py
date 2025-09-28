@@ -1,11 +1,15 @@
-# load_adl.py
 from __future__ import annotations
-import json, torch, random
+import json, random, torch
 from torch.utils.data import Dataset
 from typing import List, Dict, Any, Optional
 
 class ADLPselDataset(Dataset):
-    """把 HW1 的段落選擇資料轉成 Multiple Choice 格式。"""
+    """
+    把 HW1 的段落選擇資料轉成 Multiple Choice 格式。
+    - context_file: 一個「list[str]」的 JSON，每個索引即為 pid（0-based 或資料中使用的整數）。
+    - qa_file:      list[{"id","question","paragraphs":[pid...],"relevant": pid 或 None, ...}]
+    - fixed_k:      若指定，會保留正解並從其餘候選隨機抽到固定個數（不足則全用）。
+    """
     def __init__(
         self,
         context_path: str,
@@ -13,115 +17,139 @@ class ADLPselDataset(Dataset):
         tokenizer,
         max_length: int = 512,
         split: str = "train",
-        fixed_k: Optional[int] = None,          # ← 選配：固定 K 候選
-        neg_sampler: Optional[str] = None,      # ← 選配：'random' / 'bm25' / 'embed'
-        seed: int = 42
+        fixed_k: Optional[int] = None,
+        rng_seed: int = 42,
     ):
         self.tok = tokenizer
         self.L = max_length
         self.split = split
         self.fixed_k = fixed_k
-        self.neg_sampler = neg_sampler
-        random.seed(seed)
 
+        # 讀 context（list[str]）
         with open(context_path, "r", encoding="utf-8") as f:
-            self.ctx = json.load(f)  # {pid: paragraph_text}
+            ctx_list = json.load(f)
+        if not isinstance(ctx_list, list):
+            raise ValueError("context.json 應該是 list[str]，但讀到的不是 list。")
+        # 直接用整數 pid -> text 的 mapping
+        self.ctx_by_id: Dict[int, str] = {i: s for i, s in enumerate(ctx_list)}
 
+        # 讀 QA
         with open(qa_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        if not isinstance(raw, list):
+            raise ValueError("train/valid 應該是 list[dict] 格式。")
 
-        # 若要做固定 K，需要全域可取的所有 pid
-        self.all_pids = list(self.ctx.keys())
+        # 固定隨機種子（抽負例用）
+        self.rng = random.Random(rng_seed)
 
         self.samples = []
         for ex in raw:
             qid = ex.get("id")
-            q = ex.get("question")
-            para_ids: List[str] = ex.get("paragraphs") or ex.get("paragraph_ids") or []
-            choices: List[str] = [self.ctx[pid] for pid in para_ids]
+            q = ex.get("question", "")
+            para_ids: List[int] = ex.get("paragraphs") or []
+            # 轉成文字，pid 可能不連續，但必須存在於 context
+            choices_full: List[str] = []
+            valid_indices: List[int] = []
+            for pid in para_ids:
+                if pid in self.ctx_by_id:
+                    choices_full.append(self.ctx_by_id[pid])
+                    valid_indices.append(pid)
 
-            # 標註正解（可能在 valid/test 沒有）
-            label = -1
-            rel = ex.get("relevant")
+            # 找正解（可能沒有）
+            rel = ex.get("relevant", None)
+            gold_idx_in_full = None
             if rel is not None and rel in para_ids:
-                label = para_ids.index(rel)
+                # 用在 "full" 內的索引
+                try:
+                    gold_idx_in_full = para_ids.index(rel)
+                except ValueError:
+                    gold_idx_in_full = None
 
-            # 選配：固定 K 候選（示範 random，之後可換 BM25/embedding）
-            if self.fixed_k is not None and len(choices) != self.fixed_k:
-                choices, label = self._pad_or_trim_choices(para_ids, label, self.fixed_k)
+            # 如果有固定 K，做「保留正解 + 抽負例」
+            if self.fixed_k is not None and len(choices_full) > 0:
+                if (gold_idx_in_full is not None) and (0 <= gold_idx_in_full < len(choices_full)):
+                    negatives = [i for i in range(len(choices_full)) if i != gold_idx_in_full]
+                    need_neg = max(0, self.fixed_k - 1)
+                    if len(negatives) > need_neg:
+                        chosen_negs = self.rng.sample(negatives, need_neg)
+                    else:
+                        chosen_negs = negatives
+                    pick_indices = [gold_idx_in_full] + chosen_negs
+                    # 為了不把正解固定在 0 位，打亂後再算 label
+                    self.rng.shuffle(pick_indices)
+                    choices = [choices_full[i] for i in pick_indices]
+                    label = pick_indices.index(gold_idx_in_full)
+                else:
+                    # 沒正解 或正解不在 choices_full 裡：只能截斷/抽樣前 fixed_k 個，label = -1
+                    if len(choices_full) > self.fixed_k:
+                        # 沒有正解時就隨機抽 fixed_k
+                        pick_indices = list(range(len(choices_full)))
+                        self.rng.shuffle(pick_indices)
+                        pick_indices = pick_indices[: self.fixed_k]
+                        choices = [choices_full[i] for i in pick_indices]
+                    else:
+                        choices = choices_full
+                    label = -1
+            else:
+                # 不固定 K：全用
+                choices = choices_full
+                if gold_idx_in_full is not None:
+                    label = gold_idx_in_full
+                else:
+                    label = -1
 
-            # 防呆
-            if label != -1:
-                assert 0 <= label < len(choices), f"label {label} out of range C={len(choices)} for qid={qid}"
-            assert len(choices) >= 2, f"choices too few for qid={qid}"
+            # 保底：至少要有一個選項
+            if len(choices) == 0:
+                # 放一個空字串佔位，避免崩潰
+                choices = ["（空段落）"]
+                label = -1
 
             self.samples.append({
                 "id": qid,
                 "question": q,
                 "choices": choices,
-                "label": label,
+                "label": int(label),
             })
-
-    def _pad_or_trim_choices(self, para_ids: List[str], label: int, K: int):
-        """把候選修成固定 K：若不足，補負例；若過多，隨機下采樣（保留正例）"""
-        choices_pids = para_ids[:]
-        # 先確保正例在
-        if label == -1:
-            # 沒標 label 就隨機指定一個為「準正例」（train 可用，val/test 保持 -1）
-            pass
-        else:
-            pos_pid = para_ids[label]
-
-        # 補到 K
-        while len(choices_pids) < K:
-            # 簡單 random：之後可換 BM25 / embedding 相似
-            pid = random.choice(self.all_pids)
-            if pid not in choices_pids:
-                choices_pids.append(pid)
-
-        # 若超過 K，保留正例 + 隨機抽負例湊 K
-        if len(choices_pids) > K:
-            if label != -1:
-                pos_pid = para_ids[label]
-                neg_pool = [p for p in choices_pids if p != pos_pid]
-                sampled_negs = random.sample(neg_pool, K - 1)
-                choices_pids = [pos_pid] + sampled_negs
-                random.shuffle(choices_pids)
-                label = choices_pids.index(pos_pid)
-            else:
-                choices_pids = random.sample(choices_pids, K)
-                label = -1
-
-        choices = [self.ctx[pid] for pid in choices_pids]
-        return choices, label
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, i): return self.samples[i]
 
 
 def psel_collate(batch: List[Dict[str, Any]], tokenizer, max_length=512):
-    """組成模型要的 [B, C, L] tensors。"""
+    """
+    組成模型要的 [B, C, L] tensors。
+    兼容沒有 token_type_ids 的 tokenizer（例如 RoBERTa 類）。
+    """
     input_ids, attention_mask, token_type_ids, labels = [], [], [], []
     ids, questions, choices_text = [], [], []
 
     for ex in batch:
-        q = ex["question"]; ch = ex["choices"]
-        enc = tokenizer([q]*len(ch), ch,
-                        truncation="only_second",        # ← 關鍵：只截斷段落
-                        padding="max_length",
-                        max_length=max_length,
-                        return_token_type_ids=True,
-                        return_tensors="pt")
+        q = ex["question"]
+        ch = ex["choices"]
+        enc = tokenizer(
+            [q] * len(ch),
+            ch,
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+            return_token_type_ids=True,
+            return_tensors="pt"
+        )
         input_ids.append(enc["input_ids"])               # [C, L]
         attention_mask.append(enc["attention_mask"])     # [C, L]
-        # 有些 tokenizer 可能沒有 token_type_ids，視模型而定
-        token_type_ids.append(enc.get("token_type_ids", torch.zeros_like(enc["input_ids"])))
+        if "token_type_ids" in enc:
+            token_type_ids.append(enc["token_type_ids"])
+        else:
+            # 沒有 token_type_ids：補零
+            token_type_ids.append(torch.zeros_like(enc["input_ids"]))
         labels.append(ex["label"])
-        ids.append(ex["id"]); questions.append(q); choices_text.append(ch)
+        ids.append(ex.get("id"))
+        questions.append(q)
+        choices_text.append(ch)
 
-    batch_input_ids   = torch.stack(input_ids, dim=0)    # [B, C, L]
-    batch_attention   = torch.stack(attention_mask, 0)   # [B, C, L]
-    batch_token_type  = torch.stack(token_type_ids, 0)   # [B, C, L]
+    batch_input_ids  = torch.stack(input_ids, dim=0)       # [B, C, L]
+    batch_attention  = torch.stack(attention_mask, 0)      # [B, C, L]
+    batch_token_type = torch.stack(token_type_ids, 0)      # [B, C, L]
     labels = torch.tensor(labels, dtype=torch.long)
 
     return {
