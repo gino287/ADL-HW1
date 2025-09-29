@@ -40,7 +40,6 @@ def extract_paragraphs_for_id(sid: str, selected_obj, context_db) -> List[str]:
             if isinstance(p, str):
                 out.append(p)
             elif isinstance(p, int):
-                # pid -> text
                 if isinstance(context_db, dict):
                     t = context_db.get(str(p)) or context_db.get(p)
                 else:
@@ -100,13 +99,24 @@ def build_items(test_path: str, selected_path: str, context_path: str) -> List[Q
 def infer(args):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tok = AutoTokenizer.from_pretrained(args.ckpt_dir, use_fast=True)
-    model = AutoModelForQuestionAnswering.from_pretrained(args.ckpt_dir).to(device)
+
+    # --- 路徑健檢與容錯 ---
+    ckpt = os.path.expanduser(args.ckpt_dir)
+    if not os.path.isdir(ckpt):
+        if os.path.isdir(os.path.join(ckpt, "best")):
+            ckpt = os.path.join(ckpt, "best")
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint folder not found: {args.ckpt_dir}\n"
+                f"請確認路徑（例如 models/span_roberta_large_a100/best）。"
+            )
+
+    tok = AutoTokenizer.from_pretrained(ckpt, use_fast=True)
+    model = AutoModelForQuestionAnswering.from_pretrained(ckpt).to(device)
     model.eval()
 
     items = build_items(args.test, args.selected, args.context)
 
-    # 保留 encodings 以取得 sequence_ids()（判斷哪些 token 屬於 context）
     encoded = tok(
         [it.question for it in items],
         [it.paragraph for it in items],
@@ -118,39 +128,44 @@ def infer(args):
         return_token_type_ids=True,
         padding="max_length"
     )
-    encodings = encoded.encodings  # list of EncodingFast（對每個滑窗）
     sample_mapping = encoded.pop("overflow_to_sample_mapping")
     offset_mapping = encoded["offset_mapping"]
-    token_type_ids = encoded.get("token_type_ids", None)  # 可能不存在的 tokenizer 也能運行
+    token_type_ids = encoded.get("token_type_ids", None)
 
-    # 對每個 window 構建「有效 context token」mask（sid==1）
-    # 注意：不同 tokenizer 對 special/question token 的 offset 可能是 None 或 (0,0)，兩者都當作無效
+    # 構建「有效 context token」mask：用 BatchEncoding.sequence_ids(i)
     valid_masks: List[List[bool]] = []
-    for i, enc in enumerate(encodings):
-        seq_ids = enc.sequence_ids()
+    total = len(encoded["input_ids"])
+    for i in range(total):
+        # 在某些版本中，sequence_ids 是 BatchEncoding 的方法
+        seq_ids = encoded.sequence_ids(i) if hasattr(encoded, "sequence_ids") else None
+        # 後備方案：用 token_type_ids 區分（BERT系常見：0=question/cls/sep, 1=context）
+        if seq_ids is None:
+            if token_type_ids is not None:
+                seq_ids = [0 if tt == 0 else 1 for tt in token_type_ids[i]]
+            else:
+                # 保守策略：都當成 context（理論上不會走到這）
+                seq_ids = [1] * len(encoded["input_ids"][i])
+
         offsets = offset_mapping[i]
         mask = []
         for sid, off in zip(seq_ids, offsets):
-            is_ctx = (sid == 1)
             if off is None:
                 mask.append(False)
             else:
                 s_off, e_off = off
+                is_ctx = (sid == 1)
                 mask.append(is_ctx and (e_off > s_off))
         valid_masks.append(mask)
 
     # 批次推論
-    best_for_id: Dict[str, Tuple[float, str]] = {}  # id -> (score, text)
-
+    best_for_id: Dict[str, Tuple[float, str]] = {}
     B = args.bs
-    total = len(encoded["input_ids"])
     with torch.no_grad():
         pbar = tqdm(range(0, total, B), desc="Infer", unit="batch")
         for i in pbar:
             sl = slice(i, i+B)
             input_ids = torch.tensor(encoded["input_ids"][sl]).to(device)
             attn_mask = torch.tensor(encoded["attention_mask"][sl]).to(device)
-
             if token_type_ids is None:
                 tti = torch.zeros_like(input_ids)
             else:
@@ -160,13 +175,11 @@ def infer(args):
             s_logits = out.start_logits.detach().cpu()
             e_logits = out.end_logits.detach().cpu()
 
-            # 對非 context token 置 -inf，避免選到 CLS/問題/特殊符號
             for j in range(s_logits.size(0)):
                 vm = torch.tensor(valid_masks[i+j])
                 s_logits[j][~vm] = float("-inf")
                 e_logits[j][~vm] = float("-inf")
 
-                # small top-k grid search
                 k = min(20, s_logits.shape[1])
                 s_top = torch.topk(s_logits[j], k=k).indices.tolist()
                 e_top = torch.topk(e_logits[j], k=k).indices.tolist()
@@ -180,19 +193,15 @@ def infer(args):
                     for e in e_top:
                         if e < s: continue
                         if e - s + 1 > args.max_answer_length: continue
-                        # 無效 token（理論上已經被遮）再保險一次
                         off_s, off_e = offsets[s], offsets[e]
                         if off_s is None or off_e is None: continue
                         if off_e[1] <= off_s[0]: continue
                         sc = s_logits[j][s].item() + e_logits[j][e].item()
                         s_char, e_char = off_s[0], off_e[1]
                         pred = it.paragraph[s_char:e_char].strip()
-                        if not pred:
-                            continue
-                        if sc > best_score:
+                        if pred and sc > best_score:
                             best_s, best_e, best_score, best_text = s, e, sc, pred
 
-                # 若真的都抓不到有效片段，退而求其次：拿 logits 最高的一組（可能是空字串）
                 if best_text == "":
                     s_idx = int(torch.argmax(s_logits[j]))
                     e_idx = int(torch.argmax(e_logits[j]))
@@ -208,9 +217,7 @@ def infer(args):
                 if best_score > old[0]:
                     best_for_id[it.id] = (best_score, best_text)
 
-    # 收斂成最終答案
     final: Dict[str, str] = {qid: txt for qid, (sc, txt) in best_for_id.items()}
-
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(final, f, ensure_ascii=False)
