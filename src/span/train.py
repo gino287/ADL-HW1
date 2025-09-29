@@ -31,7 +31,6 @@ def get_id_and_question(ex: dict) -> Tuple[str, str]:
     return sid, q
 
 def extract_answer_texts(ex: dict) -> List[str]:
-    # 支援多種答案欄位格式
     if isinstance(ex.get("answer"), dict) and isinstance(ex["answer"].get("text"), str):
         t = ex["answer"]["text"].strip()
         return [t] if t else []
@@ -79,13 +78,12 @@ class QAExample:
     question: str
     context: str
     answer_text: str
-    answer_start: int  # char idx
-    answer_end: int    # char idx (exclusive)
+    answer_start: int
+    answer_end: int
 
 def _first_hit_span(contexts: List[str], answers: List[str]) -> Optional[Tuple[str,int,int,str]]:
-    """在多個候選段中找出第一個包含任一答案字串的 (ctx, s, e, ans)。"""
     for a in answers:
-        if not a: 
+        if not a:
             continue
         for c in contexts:
             pos = c.find(a)
@@ -97,7 +95,6 @@ def build_examples(split_path: str,
                    context_path: str,
                    psel_kv: Optional[Dict[str, Dict[str, List[str]]]] = None,
                    use_psel_only: bool = False) -> List[QAExample]:
-    """優先用 psel 選出的段落（文字串），否則回退到原始的 paragraphs/contexts/context。"""
     data = load_json(split_path)
     ctx_db = load_json(context_path)
     iterable = data if isinstance(data, list) else data.get("data", [])
@@ -111,12 +108,10 @@ def build_examples(split_path: str,
             miss += 1
             continue
 
-        # 先嘗試用 psel 選出來的
         cands: List[str] = []
         if psel_kv is not None and sid in psel_kv:
             cands = list(psel_kv[sid].get("paragraphs", []) or [])
 
-        # 不夠就回退到原始欄位
         if (not cands) and (not use_psel_only):
             if "paragraphs" in ex and isinstance(ex["paragraphs"], list):
                 cands = normalize_para_ids_to_texts(ex["paragraphs"], ctx_db)
@@ -125,7 +120,6 @@ def build_examples(split_path: str,
             elif isinstance(ex.get("context"), str):
                 cands = [ex["context"]]
 
-        # relevant（id/索引）在回退時優先
         if (not cands) and (not use_psel_only) and ("relevant" in ex):
             t = get_para_text_by_id(ex["relevant"], ctx_db)
             if isinstance(t, str):
@@ -171,13 +165,12 @@ class SpanQADataset(Dataset):
             return_token_type_ids=True,
         )
         self.sample_mapping = self.enc.pop("overflow_to_sample_mapping")
-        self.offset_mapping = self.enc["offset_mapping"]  # list of list[(start,end)]
+        self.offset_mapping = self.enc["offset_mapping"]
 
-        # 建 label（僅訓練用）
         if is_train:
             self.starts, self.ends = self._create_labels()
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.enc["input_ids"])
 
     def __getitem__(self, i):
@@ -193,9 +186,8 @@ class SpanQADataset(Dataset):
             smp_idx = self.sample_mapping[i]
             it      = self.items[smp_idx]
             offsets = self.offset_mapping[i]
-            seq_ids = self.enc.sequence_ids(i)  # None/0(question)/1(context)
+            seq_ids = self.enc.sequence_ids(i)
 
-            # 僅考慮 context 的 token，避免 special/question 影響
             valid_idx = [k for k, sid in enumerate(seq_ids) if sid == 1 and offsets[k] is not None]
             if not valid_idx:
                 cls_index = self.enc["input_ids"][i].index(self.tok.cls_token_id) \
@@ -207,13 +199,12 @@ class SpanQADataset(Dataset):
 
             for k in valid_idx:
                 s_off, e_off = offsets[k]
-                if s_off is None or e_off is None: 
+                if s_off is None or e_off is None:
                     continue
                 if start_tok is None and s_off <= start_char < e_off:
                     start_tok = k
                 if end_tok is None and s_off < end_char <= e_off:
                     end_tok = k
-                # 極短答案可能被單一 token 完整包住
                 if s_off <= start_char and end_char <= e_off:
                     start_tok = end_tok = k
                     break
@@ -223,7 +214,6 @@ class SpanQADataset(Dataset):
                             if self.tok.cls_token_id in self.enc["input_ids"][i] else 0
                 starts.append(cls_index); ends.append(cls_index); continue
 
-            # answer 長度上限
             if end_tok - start_tok + 1 > self.max_answer_length:
                 end_tok = start_tok + self.max_answer_length - 1
                 end_tok = max(end_tok, start_tok)
@@ -243,7 +233,7 @@ def compute_em_f1(pred: str, golds: List[str]) -> Tuple[float, float]:
     golds_n = [_normalize_text(g) for g in golds if g is not None]
     if any(pred_n == g for g in golds_n):
         return 1.0, 1.0
-    def to_units(x: str): return list(x)  # 中文用逐字
+    def to_units(x: str): return list(x)
     p_set = to_units(pred_n)
     best_f1 = 0.0
     for g in golds_n:
@@ -266,22 +256,24 @@ def compute_em_f1(pred: str, golds: List[str]) -> Tuple[float, float]:
     return 0.0, best_f1
 
 @torch.no_grad()
-def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_answer_length: int) -> Tuple[float, float]:
+def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_answer_length: int,
+             num_workers: int = 2):  # NEW: workers 參數
     model.eval()
-    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0))  # NEW
     sample_map = dataset.sample_mapping
     offsets    = dataset.offset_mapping
     items      = dataset.items
 
     best_for_id: Dict[str, Tuple[float, str]] = {}
     for batch_idx, batch in enumerate(dl):
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attn_mask = batch["attention_mask"].to(device, non_blocking=True)
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
         else:
-            token_type_ids = token_type_ids.to(device)
+            token_type_ids = token_type_ids.to(device, non_blocking=True)
 
         out = model(input_ids=input_ids, attention_mask=attn_mask, token_type_ids=token_type_ids, return_dict=True)
         s_logits = out.start_logits.detach().cpu()
@@ -293,12 +285,10 @@ def evaluate(model, tok, dataset: SpanQADataset, batch_size: int, device, max_an
             smp  = sample_map[gidx]
             it   = items[smp]
             off  = offsets[gidx]
-            # 只挑有 offset 的 token，避免選到 special
             valid_idx = [k for k, (s_off, e_off) in enumerate(off) if (s_off is not None and e_off is not None and not (s_off == 0 and e_off == 0))]
             if not valid_idx:
                 continue
 
-            # 取前k名組合尋優
             k = min(20, len(off))
             s_top = torch.topk(s_logits[j][valid_idx], k=min(k, len(valid_idx))).indices.tolist()
             e_top = torch.topk(e_logits[j][valid_idx], k=min(k, len(valid_idx))).indices.tolist()
@@ -340,9 +330,8 @@ def parse_args():
     ap.add_argument("--train", type=str, required=True)
     ap.add_argument("--valid", type=str, required=True)
     ap.add_argument("--context", type=str, required=True)
-    # optional: psel selected（KV 格式：{id: {"paragraphs": [...]}}）
     ap.add_argument("--psel_selected", type=str, default=None,
-                    help="使用段落選結果來限制候選（建議給 out/psel_selected_all.json）")
+                    help="使用段落選結果（建議 out/psel_selected_all.json）")
     ap.add_argument("--use_psel_only", action="store_true",
                     help="只用 psel 段落，不回退到原始 paragraphs/contexts/context")
     # model
@@ -360,21 +349,22 @@ def parse_args():
     ap.add_argument("--doc_stride", type=int, default=128)
     ap.add_argument("--max_answer_length", type=int, default=64)
     # misc
-    ap.add_argument("--eval_every", type=int, default=1000)  # 0 = 每個 epoch 評估一次
+    ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
+    # NEW: 混合精度選項（A100 推 bf16）
+    ap.add_argument("--amp", type=str, default="bf16", choices=["bf16","fp16","none"])
     return ap.parse_args()
 
 def main():
     args = parse_args()
     set_seed(args.seed)
+    torch.backends.cudnn.benchmark = True  # NEW: 固定長度/形狀時可加速
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 讀 psel 選段（可選）
     psel_kv = load_json(args.psel_selected) if args.psel_selected else None
 
-    # tokenizer & data
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     train_items = build_examples(args.train, args.context, psel_kv, args.use_psel_only)
     valid_items = build_examples(args.valid, args.context, psel_kv, args.use_psel_only)
@@ -382,10 +372,15 @@ def main():
     train_ds = SpanQADataset(train_items, tok, args.max_length, args.doc_stride, is_train=True,  max_answer_length=args.max_answer_length)
     valid_ds = SpanQADataset(valid_items, tok, args.max_length, args.doc_stride, is_train=False, max_answer_length=args.max_answer_length)
 
-    train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True,  num_workers=args.num_workers)
-    # eval 用較大的 batch
-    valid_dl = DataLoader(valid_ds, batch_size=max(2, args.bs), shuffle=False, num_workers=args.num_workers)
-
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.bs,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,                        # NEW
+        persistent_workers=(args.num_workers>0) # NEW
+    )
+    valid_bs = max(2, args.bs)
     # model / optim / sched
     model = AutoModelForQuestionAnswering.from_pretrained(args.model).to(device)
 
@@ -403,9 +398,12 @@ def main():
     warmups = int(tot_updates * args.warmup_ratio)
     sched = get_linear_schedule_with_warmup(optim, num_warmup_steps=warmups, num_training_steps=tot_updates)
 
-    scaler = GradScaler()
-    model.train()
+    # NEW: bf16 不需要 scaler；fp16 才啟用
+    use_bf16 = (args.amp == "bf16")
+    use_fp16 = (args.amp == "fp16")
+    scaler = GradScaler(enabled=use_fp16)
 
+    model.train()
     best_f1, best_path = -1.0, os.path.join(args.output_dir, "best")
 
     global_step, running = 0, 0.0
@@ -413,16 +411,18 @@ def main():
 
     for ep in range(1, args.epochs + 1):
         for step, batch in enumerate(train_dl, start=1):
-            input_ids = batch["input_ids"].to(device)
-            attn      = batch["attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attn      = batch["attention_mask"].to(device, non_blocking=True)
             ttype     = batch.get("token_type_ids")
             if ttype is None:
                 ttype = torch.zeros_like(input_ids)
-            ttype     = ttype.to(device)
-            start_pos = batch["start_positions"].to(device)
-            end_pos   = batch["end_positions"].to(device)
+            ttype     = ttype.to(device, non_blocking=True)
+            start_pos = batch["start_positions"].to(device, non_blocking=True)
+            end_pos   = batch["end_positions"].to(device, non_blocking=True)
 
-            with autocast():
+            # NEW: 選擇 amp dtype
+            amp_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else None)
+            if amp_dtype is None:
                 out  = model(
                     input_ids=input_ids,
                     attention_mask=attn,
@@ -432,16 +432,34 @@ def main():
                     return_dict=True
                 )
                 loss = out.loss / args.grad_accum
+                loss.backward()
+            else:
+                with autocast(dtype=amp_dtype):
+                    out  = model(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        token_type_ids=ttype,
+                        start_positions=start_pos,
+                        end_positions=end_pos,
+                        return_dict=True
+                    )
+                    loss = out.loss / args.grad_accum
+                if use_fp16:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            scaler.scale(loss).backward()
             running += loss.item()
 
             if step % args.grad_accum == 0:
-                scaler.unscale_(optim)
+                if use_fp16:
+                    scaler.unscale_(optim)
                 if args.clip_grad and args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                scaler.step(optim)
-                scaler.update()
+                if use_fp16:
+                    scaler.step(optim); scaler.update()
+                else:
+                    optim.step()
                 optim.zero_grad(set_to_none=True)
                 sched.step()
                 global_step += 1
@@ -452,7 +470,7 @@ def main():
                     running = 0.0
 
                 if args.eval_every > 0 and (global_step % args.eval_every == 0):
-                    em, f1 = evaluate(model, tok, valid_ds, max(2, args.bs), device, args.max_answer_length)
+                    em, f1 = evaluate(model, tok, valid_ds, valid_bs, device, args.max_answer_length, num_workers=args.num_workers)
                     print(f"[eval@step {global_step}] valid EM={em:.4f} F1={f1:.4f}")
                     if f1 > best_f1:
                         best_f1 = f1
@@ -461,7 +479,7 @@ def main():
                         print(f"[save] new best F1={best_f1:.4f} → {best_path}")
 
         if args.eval_every == 0:
-            em, f1 = evaluate(model, tok, valid_ds, max(2, args.bs), device, args.max_answer_length)
+            em, f1 = evaluate(model, tok, valid_ds, valid_bs, device, args.max_answer_length, num_workers=args.num_workers)
             print(f"[eval@epoch {ep}] valid EM={em:.4f} F1={f1:.4f}")
             if f1 > best_f1:
                 best_f1 = f1
@@ -470,7 +488,6 @@ def main():
                 print(f"[save] new best F1={best_f1:.4f} → {best_path}")
 
     if best_f1 < 0:
-        # 至少留一份
         model.save_pretrained(best_path)
         tok.save_pretrained(best_path)
         best_f1 = 0.0
